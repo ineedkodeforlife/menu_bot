@@ -1,0 +1,16 @@
+[Unit]
+Description=Airflow standalone - business lunch bot
+After=network.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=/home/__USER__/stolovka_bot
+Environment=AIRFLOW_HOME=/home/__USER__/airflow
+Environment=STOLOVKA_PROJECT_DIR=/home/__USER__/stolovka_bot
+ExecStart=/home/__USER__/airflow-venv/bin/airflow standalone
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
