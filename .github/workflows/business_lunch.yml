@@ -2,13 +2,14 @@ name: Business Lunch Daily
 
 on:
   schedule:
-    - cron: "0 9 * * 1-5"
-      timezone: "Europe/Moscow"
+    # GitHub Actions cron is always UTC (no timezone field support).
+    # 06:00 UTC = 09:00 Europe/Moscow (UTC+3, no DST).
+    - cron: "0 6 * * 1-5"
   workflow_dispatch: {}
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest  
     steps:
       - uses: actions/checkout@v7
 
