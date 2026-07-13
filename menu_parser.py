@@ -1,8 +1,10 @@
 import io
 import re
+import time
 
 import requests
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from PIL import Image
 
@@ -64,17 +66,32 @@ CROP_MARGIN_ABOVE = 0.08
 CROP_MARGIN_BELOW = 0.35
 
 
+# Gemini иногда отвечает 503 ("high demand") — обычно проходит за минуту-две,
+# поэтому есть смысл ретраить с паузой прямо здесь, а не падать с первого раза.
+VISION_RETRY_ATTEMPTS = 4
+VISION_RETRY_DELAY_SECONDS = 30
+
+
 def _ask_vision(image_bytes: bytes, prompt: str) -> str:
-    response = client.models.generate_content(
-        model=CONFIG["llm_model"],
-        contents=[
-            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-            prompt,
-        ],
-    )
-    if not response.text or not response.text.strip():
-        raise RuntimeError("Gemini вернул пустой ответ")
-    return response.text.strip()
+    last_error = None
+    for attempt in range(1, VISION_RETRY_ATTEMPTS + 1):
+        try:
+            response = client.models.generate_content(
+                model=CONFIG["llm_model"],
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                    prompt,
+                ],
+            )
+            if not response.text or not response.text.strip():
+                raise RuntimeError("Gemini вернул пустой ответ")
+            return response.text.strip()
+        except genai_errors.ServerError as e:
+            last_error = e
+            if attempt < VISION_RETRY_ATTEMPTS:
+                print(f"⚠️ Gemini недоступен (попытка {attempt}/{VISION_RETRY_ATTEMPTS}): {e}")
+                time.sleep(VISION_RETRY_DELAY_SECONDS)
+    raise last_error
 
 
 def _locate_heading_fraction(image_bytes: bytes) -> float:
