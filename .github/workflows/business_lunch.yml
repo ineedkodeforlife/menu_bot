@@ -3,8 +3,10 @@ name: Business Lunch Daily
 on:
   schedule:
     # GitHub Actions cron is always UTC (no timezone field support).
-    # 06:00 UTC = 09:00 Europe/Moscow (UTC+3, no DST).
-    - cron: "0 6 * * 1-5"
+    # 04:45 UTC = 07:45 Europe/Moscow (UTC+3, no DST).
+    # Set well before the 09:00 target because scheduled runs on GitHub
+    # Actions are frequently delayed (observed ~2h20m delay on 2026-07-14).
+    - cron: "45 4 * * 1-5"
   workflow_dispatch: {}
 
 jobs:
