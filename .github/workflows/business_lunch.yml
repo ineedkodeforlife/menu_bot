@@ -6,7 +6,7 @@ on:
     # 04:45 UTC = 07:45 Europe/Moscow (UTC+3, no DST).
     # Set well before the 09:00 target because scheduled runs on GitHub
     # Actions are frequently delayed (observed ~2h20m delay on 2026-07-14).
-    - cron: "45 4 * * 1-5"
+    - cron: "30 3 * * 1-5"
   workflow_dispatch: {}
 
 jobs:
