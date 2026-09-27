@@ -12,6 +12,11 @@ from config import CONFIG
 
 client = genai.Client(api_key=CONFIG["gemini_api_key"])
 
+
+class MenuParseError(RuntimeError):
+    """Меню скачалось, но бизнес-ланч распознать не удалось."""
+
+
 LOCATE_PROMPT = """Это меню столовой в виде одной длинной вертикальной картинки (страницы уложены
 друг под другом). Где-то в верхней половине находится раздел с крупным зелёным заголовком
 БИЗНЕС ЛАНЧ / BUSINESS LUNCH (не путай с БИЗНЕС ЗАВТРАК / BUSINESS BREAKFAST, который идёт раньше).
@@ -60,19 +65,26 @@ EXTRACT_PROMPT = """На этом кропе меню столовой може�
 - ...
 """
 
-# Насколько широкое окно вырезаем вокруг найденной по первому проходу позиции
-# заголовка — компенсирует погрешность оценки модели.
-CROP_MARGIN_ABOVE = 0.08
-CROP_MARGIN_BELOW = 0.35
+# Окно вокруг найденного заголовка для каждой попытки: (сверху, снизу).
+# Каждая следующая попытка режет шире, последняя — вся картинка без обрезки.
+CROP_STRATEGIES = [
+    (0.08, 0.35),
+    (0.20, 0.50),
+    None,  # None = отправляем всё меню целиком
+]
 
+# Минимум, чтобы считать ответ осмысленным, а не галлюцинацией/обрывком.
+MIN_CATEGORIES = 2
+MIN_DISHES = 4
 
-# Gemini иногда отвечает 503 ("high demand") — обычно проходит за минуту-две,
-# поэтому есть смысл ретраить с паузой прямо здесь, а не падать с первого раза.
 VISION_RETRY_ATTEMPTS = 4
 VISION_RETRY_DELAY_SECONDS = 30
+DOWNLOAD_RETRY_ATTEMPTS = 3
+DOWNLOAD_RETRY_DELAY_SECONDS = 20
 
 
 def _ask_vision(image_bytes: bytes, prompt: str) -> str:
+    """Запрос к Gemini с ретраями на 5xx, 429 и пустой ответ."""
     last_error = None
     for attempt in range(1, VISION_RETRY_ATTEMPTS + 1):
         try:
@@ -83,24 +95,48 @@ def _ask_vision(image_bytes: bytes, prompt: str) -> str:
                     prompt,
                 ],
             )
-            if not response.text or not response.text.strip():
-                raise RuntimeError("Gemini вернул пустой ответ")
-            return response.text.strip()
-        except genai_errors.ServerError as e:
+            text = (response.text or "").strip()
+            if not text:
+                raise MenuParseError("Gemini вернул пустой ответ")
+            return text
+        except genai_errors.ClientError as e:
+            # 429 (лимит) имеет смысл переждать, остальные 4xx (ключ, модель) — нет
+            if getattr(e, "code", None) != 429:
+                raise
             last_error = e
-            if attempt < VISION_RETRY_ATTEMPTS:
-                print(f"⚠️ Gemini недоступен (попытка {attempt}/{VISION_RETRY_ATTEMPTS}): {e}")
-                time.sleep(VISION_RETRY_DELAY_SECONDS)
+        except (genai_errors.ServerError, MenuParseError, requests.RequestException) as e:
+            last_error = e
+
+        if attempt < VISION_RETRY_ATTEMPTS:
+            print(f"⚠️ Gemini: попытка {attempt}/{VISION_RETRY_ATTEMPTS} не удалась: {last_error}")
+            time.sleep(VISION_RETRY_DELAY_SECONDS)
     raise last_error
+
+
+def download_menu() -> bytes:
+    last_error = None
+    for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
+        try:
+            response = requests.get(CONFIG["menu_image_url"], timeout=30)
+            response.raise_for_status()
+            # Проверяем, что это действительно картинка, а не HTML-заглушка
+            Image.open(io.BytesIO(response.content)).verify()
+            return response.content
+        except Exception as e:
+            last_error = e
+            if attempt < DOWNLOAD_RETRY_ATTEMPTS:
+                print(f"⚠️ Скачивание меню: попытка {attempt}/{DOWNLOAD_RETRY_ATTEMPTS}: {e}")
+                time.sleep(DOWNLOAD_RETRY_DELAY_SECONDS)
+    raise RuntimeError(f"Не удалось скачать картинку меню: {last_error}")
 
 
 def _locate_heading_fraction(image_bytes: bytes) -> float:
     raw = _ask_vision(image_bytes, LOCATE_PROMPT)
     match = re.search(r"(?<!\d)(0(?:\.\d+)?|1(?:\.0+)?)(?!\d)", raw)
     if not match:
-        return 0.3  # разумное значение по умолчанию, если модель не дала число
-    fraction = float(match.group(1))
-    return min(max(fraction, 0.0), 1.0)
+        print(f"⚠️ Модель не вернула число ({raw!r}), беру 0.3")
+        return 0.3
+    return min(max(float(match.group(1)), 0.0), 1.0)
 
 
 def _strip_english(text: str) -> str:
@@ -114,22 +150,37 @@ def _strip_english(text: str) -> str:
     return "\n".join(lines)
 
 
-def get_business_lunch() -> str:
-    image_bytes = requests.get(CONFIG["menu_image_url"], timeout=30).content
-    image = Image.open(io.BytesIO(image_bytes))
-    width, height = image.size
+def _validate(result: str) -> None:
+    if "NOT_FOUND" in result:
+        raise MenuParseError("Раздел БИЗНЕС ЛАНЧ не найден на фрагменте")
+    categories = sum(1 for l in result.splitlines() if l.strip().startswith("### "))
+    dishes = sum(1 for l in result.splitlines() if l.strip().startswith("- ") and len(l.strip()) > 3)
+    if categories < MIN_CATEGORIES or dishes < MIN_DISHES:
+        raise MenuParseError(
+            f"Ответ выглядит неполным: категорий {categories}, блюд {dishes}\n{result}"
+        )
 
-    fraction = _locate_heading_fraction(image_bytes)
 
-    top = max(0, int(height * (fraction - CROP_MARGIN_ABOVE)))
-    bottom = min(height, int(height * (fraction + CROP_MARGIN_BELOW)))
-    crop = image.crop((0, top, width, bottom))
+def get_business_lunch(image_bytes: bytes, attempt: int = 1) -> str:
+    """attempt (1..N) выбирает стратегию обрезки: чем дальше, тем шире окно."""
+    strategy = CROP_STRATEGIES[min(attempt, len(CROP_STRATEGIES)) - 1]
 
-    buffer = io.BytesIO()
-    crop.save(buffer, format="JPEG", quality=95)
-    crop_bytes = buffer.getvalue()
+    if strategy is None:
+        print("🔎 Стратегия: всё меню целиком")
+        target_bytes = image_bytes
+    else:
+        above, below = strategy
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        width, height = image.size
+        fraction = _locate_heading_fraction(image_bytes)
+        top = max(0, int(height * (fraction - above)))
+        bottom = min(height, int(height * (fraction + below)))
+        print(f"🔎 Заголовок ~{fraction:.2f}, режем {top}..{bottom} из {height}px")
 
-    result = _ask_vision(crop_bytes, EXTRACT_PROMPT)
-    if result.strip() == "NOT_FOUND":
-        raise RuntimeError("Раздел БИЗНЕС ЛАНЧ не найден в вырезанном фрагменте меню")
-    return _strip_english(result)
+        buffer = io.BytesIO()
+        image.crop((0, top, width, bottom)).save(buffer, format="JPEG", quality=95)
+        target_bytes = buffer.getvalue()
+
+    result = _strip_english(_ask_vision(target_bytes, EXTRACT_PROMPT))
+    _validate(result)
+    return result
